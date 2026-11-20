@@ -1,70 +1,90 @@
-# Java Web App Deployment with AWS CI/CD
+# CI/CD on Scaleway with Jenkins
 
-Welcome to this project combining Java web app development and AWS CI/CD tools!
+A Java web app that goes from `git push` to live in about two minutes, with no manual steps. I first built this pipeline on AWS (CodePipeline, CodeBuild, CodeArtifact, CodeDeploy). Then I rebuilt it on **Scaleway** using **Jenkins**, to learn what a pipeline really does underneath the managed services.
 
-<br>
+```mermaid
+flowchart LR
+    dev([git push]) --> gh[GitHub<br/>nextwork-web-scaleway]
+    gh -- polled every 2 min --> jk
+    subgraph AMS1 [Scaleway AMS 1]
+        jk[Jenkins server<br/>Test → Build → Store → Deploy → Smoke test]
+    end
+    jk -- WAR per build --> os[(Object Storage<br/>bucket)]
+    jk -- SSH as 'deploy' --> web
+    subgraph AMS2 [Scaleway AMS 2]
+        web[Web server<br/>Apache :80 → Tomcat 9 :8080]
+    end
+    user([Visitor]) -- port 80 only --> web
+```
 
-## Table of Contents
-- [Introduction](#introduction)
-- [Technologies](#technologies)
-- [Setup](#setup)
-- [Contact](#contact)
-- [Conclusion](#conclusion)
+## What it does
 
-<br>
+Every push to `master`:
 
-## Introduction
-This project is used for an introduction to creating and deploying a Java-based web app using AWS, especially their CI/CD tools.
+1. **Test**: runs `run-tests.sh`
+2. **Build**: `mvn clean package` on Java 17 produces `nextwork-web-project.war`
+3. **Store**: uploads the WAR to a private Scaleway Object Storage bucket, under `builds/<build number>/`
+4. **Deploy**: copies the WAR to the web server over SSH, as a limited `deploy` user, and swaps it into Tomcat
+5. **Smoke test**: checks that the site answers within 60 seconds, and fails the build if it doesn't
 
-The deployment pipeline I'm building around the Java web app in this repository is invisible to the end-user, but makes a big impact by automating the software release processes.
+## Tech stack
 
-- I'm doing this project to learn more about CI/CD and get hands on experience in automating the flow from developing code to deployed web app.
-- This fits into my career goals because I want to become a DevOps engineer this year!
+| Area | Used |
+|---|---|
+| Cloud | Scaleway: Instances, Object Storage, IAM, security groups (region `nl-ams`) |
+| CI/CD | Jenkins LTS, declarative pipeline (`Jenkinsfile`) |
+| Build | Java 17, Maven, maven-war-plugin 3.4.0 |
+| Runtime | Ubuntu 22.04, Tomcat 9, Apache 2 reverse proxy |
+| Tooling | Bash, OpenSSH, AWS CLI v2 (talking to S3-compatible Object Storage), Git, PowerShell |
 
-<br>
+## AWS → Scaleway translation
 
-## Technologies
-Here’s what I’m using for this project:
+| On AWS | On Scaleway |
+|---|---|
+| EC2 | Instance |
+| IAM role for a service | IAM **application** + API key |
+| S3 artifact bucket | Object Storage (S3-compatible) |
+| CodePipeline + CodeBuild + CodeDeploy | Jenkins + `Jenkinsfile` |
+| CodeArtifact | Maven Central directly |
+| CodeDeploy agent + `appspec.yml` | SSH + one `deploy-war.sh` script |
 
-- **Amazon EC2**: I'm developing my web app on Amazon EC2 virtual servers, so that software development and deployment happens entirely on the cloud.
-- Key pairs, SSH connections, Git, Maven and Java.
-- **VSCode**: For my IDE, I chose Visual Studio Code. It connects directly to my development EC2 instance, making it easy to edit code and manage files in the cloud.
-- **GitHub**: All my web app code is stored and versioned in this GitHub repository.
-- **AWS CodeArtifact**: Once it's rolled out, CodeArtifact will store my artifacts and dependencies, which is great for high availability and speeding up my project's build process.
-- **AWS CodeBuild**: Once it's rolled out, CodeBuild will take over my build process. It'll compile the source code, run tests, and produce ready-to-deploy software packages automatically.
-- **AWS CodeDeploy**: Once it's rolled out, CodeDeploy will automate my deployment process across EC2 instances.
-- **AWS CodePipeline**: Once it's rolled out, CodePipeline will automate the entire process from GitHub to CodeDeploy, integrating build, test, and deployment steps into one efficient workflow.
+## Security choices
 
+- **Least privilege everywhere.** Jenkins's Scaleway identity can only use Object Storage, in one Project. On the web server, the `deploy` user can run exactly one command with `sudo`, and nothing else.
+- **No root for automation.** Day-to-day work happens as an IAM Member (`DevOps-IAM-Admin`); the Organization Owner only handles billing.
+- **Default-deny firewalls.** Inbound traffic is dropped unless a rule allows it. The public reaches only port 80; Tomcat's 8080 is closed.
+- **No secrets in Git.** API keys and the deploy key live in Jenkins credentials and are masked in build logs.
+- **Budget alerts** at 25/50/80/100% of a €20 monthly budget.
 
-<br>
+## Problems I hit and how I fixed them
 
-## Setup
-To get this project up and running on your local machine, follow these steps:
+| Problem | Root cause | Fix |
+|---|---|---|
+| Port 8080 was reachable from the internet | The security group's **inbound default policy was Accept**, so the allow rules meant nothing | Set the default to Drop; verified with `curl -m 5` timing out |
+| `Unable to load the mojo 'war'... Cannot access defaults field of Properties` | The default maven-war-plugin 2.2 can't run on Java 16+. AWS CodeBuild had used Java 8, so this never showed there | Pinned maven-war-plugin 3.4.0 and set the compiler level to 1.8 |
+| `Load key: error in libcrypto` → `Permission denied (publickey)` | The SSH private key picked up Windows line endings (`\r`) on its way through the clipboard | The Deploy stage now cleans the key (`tr -d '\r'`) before using it |
+| Emojis rendered as `ðŸ¥³` | JSP defaults to ISO-8859-1, so UTF-8 bytes were misread | Added `pageEncoding="UTF-8"` and `<meta charset="UTF-8">` |
+| Instance type out of stock in AMS 1 | Capacity varies by zone | Moved the web server to AMS 2. Security groups are per zone, so I created a matching one there |
 
-1. Clone the repository:
-    ```bash
-    git clone https://github.com/yourusername/nextwork-web-project.git
-    ```
-2. Navigate to the project directory:
-    ```bash
-    cd nextwork-web-project
-    ```
-3. Install dependencies:
-    ```bash
-    mvn install
-    ```
+## Repository layout
 
-<br>
+```
+.
+├── Jenkinsfile          # the whole pipeline: test, build, store, deploy, smoke test
+├── .gitattributes       # keeps LF line endings on scripts, even when committed from Windows
+├── pom.xml              # Java 1.8 target, maven-war-plugin 3.4.0
+├── run-tests.sh
+└── src/main/webapp/     # index.jsp (UTF-8), WEB-INF/web.xml
+```
 
-## Contact
-If you have any questions or comments about the my CI/CD project, please contact:
-Nii OB David - [davidniiamui@gmail.com](mailto:davidniiamui@gmail.com)
+The server setup scripts (`setup-jenkins.sh`, `setup-webserver.sh`) and the full step-by-step guide are in the project guide.
 
-- [LinkedIn](https://www.linkedin.com/in/niiobdavid/)
+## Cost
 
-<br>
+About €1–1.50 a day while both servers run (Jenkins BASIC3-X2C-4G at about €0.04 an hour, a small web server, and €0.005 an hour per public IPv4). Everything is torn down between sessions.
 
-## Conclusion
-Thank you for exploring this project! I'll continue to build this pipeline and apply my learnings to future projects.
+## What's next
 
-A big shoutout to **[NextWork](https://learn.nextwork.org/app)** for their project guide and support. [You can get started with this DevOps series project too by clicking here.](https://learn.nextwork.org/projects/aws-devops-vscode?track=high)
+- **Terraform**: the same infrastructure from a single `terraform apply`
+- **GitHub Actions**: the same pipeline without a Jenkins server
+- **Hybrid**: an AWS CodePipeline deploying to a Scaleway server registered as a CodeDeploy on-premises instance
