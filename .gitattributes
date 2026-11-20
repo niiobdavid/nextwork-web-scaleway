@@ -1,0 +1,4 @@
+# Keep Linux line endings on shell scripts, even when committed from Windows
+*.sh text eol=lf
+Jenkinsfile text eol=lf
+*.yml text eol=lf
