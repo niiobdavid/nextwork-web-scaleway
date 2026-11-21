@@ -70,7 +70,13 @@ pipeline {
                                                    keyFileVariable: 'SSH_KEY',
                                                    usernameVariable: 'SSH_USER')]) {
                     sh '''
-                      SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new"
+                      # Copy the key without Windows line endings (\\r) and make sure it ends with a newline
+                      KEY_FILE="$(mktemp)"
+                      trap 'rm -f "$KEY_FILE"' EXIT
+                      { tr -d '\\r' < "$SSH_KEY"; echo; } > "$KEY_FILE"
+                      chmod 600 "$KEY_FILE"
+
+                      SSH_OPTS="-i $KEY_FILE -o StrictHostKeyChecking=accept-new"
                       scp $SSH_OPTS "target/$APP_NAME.war" "$SSH_USER@$WEB_SERVER_IP:/home/deploy/incoming/$APP_NAME.war"
                       ssh $SSH_OPTS "$SSH_USER@$WEB_SERVER_IP" "sudo /usr/local/bin/deploy-war.sh"
                     '''
